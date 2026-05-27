@@ -338,7 +338,7 @@ class KnightroDemo:
         """Greet an unknown visitor and listen for commands."""
         import random
         greetings = [
-            "Hey there! Welcome to UCF! I'm Knightro!",
+            "Hey there! Welcome to U-C-F! I'm Knightro!",
             "What's up! Welcome to the Engineering building! Go Knights!",
             "Hey! I don't think we've met. I'm Knightro, UCF's mascot!",
             "Welcome, fellow Knight! How can I help you today?",
