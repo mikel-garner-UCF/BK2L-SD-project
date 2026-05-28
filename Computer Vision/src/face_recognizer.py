@@ -1,36 +1,20 @@
+"""Face recognizer using dlib 128-dim embeddings + Euclidean distance.
 
-"""
-Face recognizer using DUAL metrics: Cosine Similarity + Euclidean Distance.
+Drop-in replacement for face_recognizer.py.
+Uses the same encrypted FaceDatabase for storage.
 
-This is an improved version of face_recognizer.py that uses BOTH distance
-metrics together for more robust recognition. Using two metrics gives better
-separation between enrolled people because:
+Key differences from the ONNX/ArcFace version:
+  - 128-dim embeddings (not 512)
+  - Euclidean distance: lower = more similar (not cosine: higher = more similar)
+  - Much better separation between different people (~0.9 gap vs ~0.003)
+  - Threshold: 0.5 = match (not 0.95)
 
-  - Cosine similarity measures the ANGLE between embeddings
-    (good at: "do these faces point in the same direction?")
-
-  - Euclidean distance measures the actual DISTANCE in embedding space
-    (good at: "how far apart are these faces?")
-
-Two faces can have very similar cosine scores (0.983 vs 0.980) but
-noticeably different Euclidean distances (0.184 vs 0.200). By combining
-both, we get a composite score with better discrimination.
-
-The math for L2-normalized vectors:
-    euclidean = sqrt(2 - 2 * cosine_similarity)
-    
-    So cosine 0.983 → euclidean 0.184
-       cosine 0.980 → euclidean 0.200
-       cosine 0.950 → euclidean 0.316
-
-The gap in cosine space (0.003) becomes a larger gap in euclidean space
-(0.016), and the composite score amplifies this further.
-
-Drop-in replacement for face_recognizer.py — same API, better separation.
+The RecognitionResult.distance field contains Euclidean distance (lower = better).
+The RecognitionResult.confidence converts this to 0-1 (higher = better).
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -38,231 +22,167 @@ from face_embedder import FaceEmbedder
 from face_database import FaceDatabase
 
 
-##################### Recognition result #####################
-
 @dataclass
 class RecognitionResult:
-    """The result of trying to recognize a single face.
-
-    Attributes:
-        name: The matched person's name, or None if unknown.
-        distance: Composite similarity score (higher = more similar).
-        is_known: True if the face matched someone in the database.
-    """
+    """Result of a face recognition attempt."""
     name: Optional[str]
     distance: float
     is_known: bool
 
     @property
     def confidence(self) -> float:
-        return max(0.0, min(1.0, self.distance))
+        """Convert Euclidean distance to 0-1 confidence.
+        distance 0.0 = perfect match (100%)
+        distance 0.5 = at threshold (50%)
+        distance 1.0+ = definitely not a match (0%)
+        """
+        return max(0.0, min(1.0, 1.0 - self.distance))
 
-
-###################### The recognizer #####################
 
 class FaceRecognizer:
-    """Face recognizer using dual metrics (cosine + euclidean).
+    """Face recognizer using dlib embeddings and Euclidean distance.
 
     Usage:
-        recognizer = FaceRecognizer()
-        result = recognizer.recognize(face_crop)
+        recognizer = FaceRecognizer(distance_threshold=0.5)
+        result = recognizer.recognize(face_crop_bgr)
         if result.is_known:
-            print(f"Hello, {result.name}!")
-
-    The composite score is calculated as:
-        composite = (cosine_weight * cosine_sim) + (euclidean_weight * (1 - normalized_euclidean))
-
-    This gives a single score where higher = better match, but with
-    better separation than cosine alone.
+            print(f"Hello, {result.name}! (confidence: {result.confidence:.0%})")
     """
 
     def __init__(
         self,
-        similarity_threshold: float = 0.45,
+        distance_threshold: float = 0.5,
         min_match_ratio: float = 0.6,
-        cosine_weight: float = 0.4,
-        euclidean_weight: float = 0.6,
-        min_margin: float = 0.005,
+        min_margin: float = 0.05,
         db: Optional[FaceDatabase] = None,
         embedder: Optional[FaceEmbedder] = None,
+        # Accept similarity_threshold for backward compatibility
+        similarity_threshold: float = 0.0,
     ):
-        """Create a face recognizer with dual metrics.
+        """Create a dlib-based face recognizer.
 
         Args:
-            similarity_threshold: Minimum cosine similarity for a single
-                template to count as "matching" in the majority vote.
+            distance_threshold: Maximum Euclidean distance for a template
+                to count as "matching." Default 0.5. Lower = stricter.
+                Same person typically: 0.2-0.4
+                Different person typically: 0.8-1.2
 
-            min_match_ratio: Minimum fraction of templates that must match.
-                Default 0.6 = at least 60% of templates must be above threshold.
+            min_match_ratio: Minimum fraction of templates that must be
+                below the threshold. Default 0.6 (60%).
 
-            cosine_weight: Weight for cosine similarity in composite score.
-            euclidean_weight: Weight for euclidean component in composite score.
-                These should sum to 1.0. Higher euclidean_weight gives more
-                emphasis to absolute distance (better separation).
-
-            min_margin: Minimum composite score gap between #1 and #2
-                candidate. Default 0.005 — higher than cosine-only (0.003)
-                because the composite score has a wider range.
+            min_margin: Minimum gap between best and second-best candidate.
+                Default 0.05. With dlib this is very achievable since
+                the gap between same/different person is huge (~0.5).
 
             db: Optional FaceDatabase instance.
             embedder: Optional FaceEmbedder instance.
         """
-        self._threshold = similarity_threshold
+        self._threshold = distance_threshold
         self._min_match_ratio = min_match_ratio
-        self._cosine_weight = cosine_weight
-        self._euclidean_weight = euclidean_weight
         self._min_margin = min_margin
         self._embedder = embedder or FaceEmbedder()
         self._db = db or FaceDatabase()
 
-        self._enrolled: Dict[str, list] = self._db.get_all()
-        print(f"[face_recognizer] Ready. {len(self._enrolled)} faculty enrolled. "
-              f"Similarity threshold: {self._threshold}, "
-              f"Min match ratio: {self._min_match_ratio}, "
-              f"Weights: cosine={self._cosine_weight}, euclidean={self._euclidean_weight}")
+        self._enrolled: Dict[str, List[np.ndarray]] = self._db.get_all()
 
-    @staticmethod
-    def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-        """Cosine similarity between two L2-normalized vectors. Range: -1 to 1."""
-        return float(np.dot(a, b))
+        print(f"[face_recognizer] Ready. {len(self._enrolled)} faculty enrolled. "
+              f"Distance threshold: {self._threshold}, "
+              f"Min match ratio: {self._min_match_ratio}, "
+              f"Min margin: {self._min_margin}")
 
     @staticmethod
     def _euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
-        """Euclidean distance between two vectors. Range: 0 to ~2 for unit vectors."""
+        """Euclidean distance between two vectors."""
         return float(np.linalg.norm(a - b))
 
-    def _composite_score(self, query: np.ndarray, template: np.ndarray) -> dict:
-        """Compute both metrics and a composite score for one template.
-
-        Returns dict with cosine_sim, euclidean_dist, and composite score.
-        """
-        cosine = self._cosine_similarity(query, template)
-        euclidean = self._euclidean_distance(query, template)
-
-        # Normalize euclidean to 0-1 range (for L2-normalized vectors, max is 2.0)
-        # Then invert so higher = more similar (matching cosine convention)
-        euclidean_normalized = 1.0 - (euclidean / 2.0)
-
-        # Weighted composite
-        composite = (self._cosine_weight * cosine) + (self._euclidean_weight * euclidean_normalized)
-
-        return {
-            "cosine": cosine,
-            "euclidean": euclidean,
-            "euclidean_norm": euclidean_normalized,
-            "composite": composite,
-        }
-
     def recognize(self, face_bgr: np.ndarray) -> RecognitionResult:
-        """Recognize a face using dual metrics.
+        """Recognize a face against enrolled faculty.
 
         Process:
-        1. Compute embeddings and both distance metrics for every enrolled person
-        2. Rank by composite score (cosine + euclidean combined)
-        3. Majority vote check (enough templates must match)
-        4. Margin check (best must be clearly better than second-best)
+        1. Compute 128-dim embedding for the input face
+        2. Compare against every enrolled person using Euclidean distance
+        3. Majority vote: enough templates must be below threshold
+        4. Margin check: best must be clearly better than second-best
 
         Args:
             face_bgr: BGR face crop image.
 
         Returns:
-            RecognitionResult with the match or unknown.
+            RecognitionResult with name, distance, and is_known.
         """
         if not self._enrolled:
-            return RecognitionResult(name=None, distance=0.0, is_known=False)
+            return RecognitionResult(name=None, distance=1.0, is_known=False)
 
-        query_embedding = self._embedder.embed(face_bgr)
+        try:
+            query = self._embedder.embed(face_bgr)
+        except ValueError:
+            return RecognitionResult(name=None, distance=1.0, is_known=False)
 
-        # Step 1: Score every enrolled person with both metrics
         candidates = []
 
         for name, templates in self._enrolled.items():
-            scores = [self._composite_score(query_embedding, t) for t in templates]
+            distances = [self._euclidean_distance(query, t) for t in templates]
+            avg_dist = sum(distances) / len(distances)
+            min_dist = min(distances)
 
-            cosine_sims = [s["cosine"] for s in scores]
-            euclidean_dists = [s["euclidean"] for s in scores]
-            composites = [s["composite"] for s in scores]
-
-            # Majority vote uses cosine threshold (same as original)
-            matches = sum(1 for c in cosine_sims if c >= self._threshold)
+            # Majority vote: how many templates are below threshold?
+            matches = sum(1 for d in distances if d <= self._threshold)
             match_ratio = matches / len(templates) if templates else 0.0
 
-            avg_cosine = sum(cosine_sims) / len(cosine_sims)
-            avg_euclidean = sum(euclidean_dists) / len(euclidean_dists)
-            avg_composite = sum(composites) / len(composites)
-
-            print(f"[recognition] {name}: "
-                  f"cosine={avg_cosine:.4f}, "
-                  f"euclidean={avg_euclidean:.4f}, "
-                  f"composite={avg_composite:.4f}, "
+            print(f"[recognition] {name}: avg_dist={avg_dist:.4f}, "
+                  f"min_dist={min_dist:.4f}, "
                   f"match_ratio={matches}/{len(templates)}")
 
             candidates.append({
                 "name": name,
-                "avg_cosine": avg_cosine,
-                "avg_euclidean": avg_euclidean,
-                "avg_composite": avg_composite,
+                "avg_dist": avg_dist,
+                "min_dist": min_dist,
                 "match_ratio": match_ratio,
             })
 
-        # Step 2: Sort by COMPOSITE score (not just cosine)
-        candidates.sort(key=lambda c: c["avg_composite"], reverse=True)
-
+        # Sort by average distance (lowest = best match)
+        candidates.sort(key=lambda c: c["avg_dist"])
         best = candidates[0]
 
-        # Step 3: Majority vote
+        # Check majority vote
         if best["match_ratio"] < self._min_match_ratio:
             print(f"[recognition] → Unknown (match_ratio {best['match_ratio']:.0%} "
                   f"< {self._min_match_ratio:.0%})")
             return RecognitionResult(
                 name=None,
-                distance=best["avg_composite"],
+                distance=best["avg_dist"],
                 is_known=False,
             )
 
-        # Step 4: Margin check using composite score
+        # Check margin
         if len(candidates) >= 2:
             second = candidates[1]
-            margin = best["avg_composite"] - second["avg_composite"]
+            margin = second["avg_dist"] - best["avg_dist"]
 
-            print(f"[recognition] Margin: {best['name']}({best['avg_composite']:.4f}) - "
-                  f"{second['name']}({second['avg_composite']:.4f}) = {margin:.4f} "
+            print(f"[recognition] Margin: {second['name']}({second['avg_dist']:.4f}) - "
+                  f"{best['name']}({best['avg_dist']:.4f}) = {margin:.4f} "
                   f"(need >= {self._min_margin})")
 
             if margin < self._min_margin and second["match_ratio"] >= self._min_match_ratio:
                 print(f"[recognition] → Unknown (margin too small)")
                 return RecognitionResult(
                     name=None,
-                    distance=best["avg_composite"],
+                    distance=best["avg_dist"],
                     is_known=False,
                 )
 
-        print(f"[recognition] → {best['name']} "
-              f"(composite={best['avg_composite']:.4f}, "
-              f"cosine={best['avg_cosine']:.4f}, "
-              f"euclidean={best['avg_euclidean']:.4f})")
-
+        print(f"[recognition] → {best['name']} (dist={best['avg_dist']:.4f})")
         return RecognitionResult(
             name=best["name"],
-            distance=best["avg_composite"],
+            distance=best["avg_dist"],
             is_known=True,
         )
 
     def reload_database(self) -> None:
         """Reload enrolled faculty from the encrypted database."""
-        self._db = FaceDatabase()
         self._enrolled = self._db.get_all()
         print(f"[face_recognizer] Reloaded. {len(self._enrolled)} faculty enrolled.")
 
     @property
     def enrolled_count(self) -> int:
         return len(self._enrolled)
-
-    @property
-    def threshold(self) -> float:
-        return self._threshold
-
-    @threshold.setter
-    def threshold(self, value: float) -> None:
-        self._threshold = value
-        print(f"[face_recognizer] Threshold updated to {value}")

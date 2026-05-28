@@ -1,361 +1,326 @@
-"""
-This script is the admin-facing tool described in the Privacy Policy.
-It handles:
-  - Enrolling a new faculty member (capturing face, computing embedding, saving to encrypted database)
-  - Removing an enrolled faculty member
-  - Listing currently enrolled faculty
+"""Knightro Faculty Enrollment Tool — dlib version.
+
+Uses dlib 128-dim embeddings stored in an encrypted database
+(separate from the old ONNX database).
+
+Database files:
+  - Computer Vision/data/dlib_face_embeddings.enc  (encrypted embeddings)
+  - Computer Vision/data/.dlib_encryption_key      (encryption key)
+
+The old ONNX database is left untouched as a backup:
+  - Computer Vision/data/face_embeddings.enc
+  - Computer Vision/data/.encryption_key
 
 Usage:
-    # Enroll a new faculty member (opens webcam for photo capture)
     python src/enroll.py --enroll --name "Dr. Smith"
-
-    # Enroll using a photo file instead of webcam
-    python src/enroll.py --enroll --name "Dr. Smith" --photo path/to/photo.jpg
-
-    # Remove a faculty member
-    python src/enroll.py --remove --name "Dr. Smith"
-
-    # List all enrolled faculty
     python src/enroll.py --list
-
-Depends on: 
-    > face_detection.py
-    > face_embedder.py
-    > face_database.py
+    python src/enroll.py --remove --name "Dr. Smith"
+    python src/enroll.py --test
 """
 
 import argparse
 import sys
 import time
 from pathlib import Path
- 
-# Add src/ to path so we can import our modules.
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
- 
+
 import cv2
 import numpy as np
- 
-from face_detection import FaceDetector, BoundingBox
+
+from face_detection import FaceDetector
 from face_embedder import FaceEmbedder
- 
- 
-# ---------------------------------------------------------------------------
-# Face capture from webcam
-# ---------------------------------------------------------------------------
- 
-def capture_faces_from_webcam(
-        
-    detector: FaceDetector,
-    num_captures: int = 5,
-    delay_between: float = 0.5,
-) -> list[np.ndarray]:
-    """Open the webcam and capture multiple face crops.
- 
-    The script guides the user through the capture process:
-    press SPACE to capture each frame, or 'a' for automatic mode.
- 
-    Args:
-        detector: A FaceDetector instance.
-        num_captures: How many face images to capture (default 5).
-        delay_between: Seconds between auto-captures.
- 
-    Returns:
-        A list of BGR face crops (numpy arrays), one per capture.
-    """
+from face_database import FaceDatabase
+
+# dlib database paths (separate from ONNX)
+DLIB_DB_PATH = PROJECT_ROOT / "data" / "dlib_face_embeddings.enc"
+DLIB_KEY_PATH = PROJECT_ROOT / "data" / ".dlib_encryption_key"
+
+
+def get_db() -> FaceDatabase:
+    """Get the dlib face database."""
+    return FaceDatabase(db_path=DLIB_DB_PATH, key_path=DLIB_KEY_PATH)
+
+
+def enroll_faculty(name: str, photo_path: str | None = None) -> bool:
+    """Enroll a faculty member using dlib embeddings."""
+    print(f"\n=== Enrolling: {name} (dlib 128-dim) ===")
+
+    detector = FaceDetector(min_confidence=0.5)
+    embedder = FaceEmbedder()
+
+    if photo_path:
+        crops = _capture_from_photo(detector, photo_path)
+    else:
+        crops = _capture_from_webcam(detector, num_captures=10)
+
+    if not crops:
+        print("ERROR: No faces captured.")
+        return False
+
+    print(f"\nComputing dlib embeddings from {len(crops)} captures...")
+    embeddings = []
+    for i, crop in enumerate(crops):
+        try:
+            emb = embedder.embed(crop)
+            embeddings.append(emb)
+            print(f"  Embedding {i+1}/{len(crops)}: dim={len(emb)}")
+        except ValueError as e:
+            print(f"  Skipped capture {i+1}: {e}")
+
+    if not embeddings:
+        print("ERROR: No embeddings computed.")
+        return False
+
+    # Quality check: internal consistency
+    if len(embeddings) >= 2:
+        pairwise = []
+        for i in range(len(embeddings)):
+            for j in range(i + 1, len(embeddings)):
+                pairwise.append(np.linalg.norm(embeddings[i] - embeddings[j]))
+        avg_self = np.mean(pairwise)
+        print(f"\n  Internal consistency: avg self-distance = {avg_self:.4f}")
+        if avg_self > 0.45:
+            print(f"  WARNING: Self-distance is high. Some captures may be bad.")
+
+    # Quality check: separation from existing people
+    db = get_db()
+    existing = db.get_all()
+    if existing:
+        print(f"\n  Separation check against {len(existing)} enrolled:")
+        new_centroid = np.mean(embeddings, axis=0)
+        for other_name, other_templates in existing.items():
+            if other_name == name:
+                continue
+            other_centroid = np.mean(other_templates, axis=0)
+            dist = np.linalg.norm(new_centroid - other_centroid)
+            status = "GOOD" if dist > 0.6 else "OK" if dist > 0.4 else "CLOSE"
+            print(f"    vs {other_name}: distance = {dist:.4f} [{status}]")
+
+    # Save
+    db.add_face(name, embeddings)
+    db.save()
+    print(f"\nSUCCESS: {name} enrolled with {len(embeddings)} dlib templates.")
+    return True
+
+
+def _capture_from_webcam(detector: FaceDetector, num_captures: int = 10) -> list:
+    """Capture face crops from webcam with angle guidance."""
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("ERROR: Could not open webcam.")
         return []
- 
-    print(f"\nWebcam opened. We need to capture {num_captures} face images.")
-    print("Position the faculty member in front of the camera.")
-    print("Controls:")
-    print("  SPACE = capture a frame")
-    print("  'a'   = auto-capture mode (captures every 0.5s)")
-    print("  'q'   = quit without saving")
+
+    print(f"\nCapturing {num_captures} face images.")
+    print("Vary your head angle for better recognition:")
+    print("  Captures 1-3: Look STRAIGHT")
+    print("  Captures 4-5: Turn slightly LEFT")
+    print("  Captures 6-7: Turn slightly RIGHT")
+    print("  Captures 8-9: Tilt slightly UP/DOWN")
+    print("  Capture 10:   45-degree angle")
     print()
- 
-    face_crops: list[np.ndarray] = []
+    print("  SPACE = capture | 'a' = auto-capture | 'q' = quit")
+    print()
+
+    guidance = [
+        "Look STRAIGHT at camera", "Look STRAIGHT at camera", "Look STRAIGHT at camera",
+        "Turn head slightly LEFT", "Turn head slightly LEFT",
+        "Turn head slightly RIGHT", "Turn head slightly RIGHT",
+        "Tilt head slightly UP", "Tilt head slightly DOWN",
+        "Try a 45-degree angle",
+    ]
+
+    crops = []
     auto_mode = False
-    last_capture_time = 0.0
- 
+    last_capture = 0.0
+
     with detector:
-        while len(face_crops) < num_captures:
-            success, frame = cap.read()
-            if not success:
-                print("WARN: Failed to read frame.")
+        while len(crops) < num_captures:
+            ret, frame = cap.read()
+            if not ret:
                 break
- 
+
             frame = cv2.flip(frame, 1)
             boxes = detector.detect(frame)
- 
-            # Draw UI
             display = frame.copy()
-            status = f"Captured: {len(face_crops)}/{num_captures}"
+
+            # Draw face boxes
+            for box in boxes:
+                cv2.rectangle(display, (box.x, box.y), (box.x2, box.y2),
+                              (0, 199, 255), 2)
+
+            # Status
+            status = f"Captured: {len(crops)}/{num_captures}"
             if auto_mode:
                 status += " [AUTO]"
- 
-            # Draw boxes around detected faces
-            for box in boxes:
-                color = (4, 201, 255)  # UCF Gold
-                cv2.rectangle(display, (box.x, box.y), (box.x2, box.y2), color, 2)
- 
-            # Status text with black outline + gold fill
-            for color, thickness in [((0, 0, 0), 4), ((4, 201, 255), 2)]:
-                cv2.putText(display, status, (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thickness)
- 
-            if len(boxes) == 0:
-                cv2.putText(display, "No face detected - adjust position",
-                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 0, 255), 1)
-            elif len(boxes) > 1:
-                cv2.putText(display, "Multiple faces - only one person please",
-                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 0, 255), 1)
- 
-            cv2.imshow("Knightro Enrollment", display)
- 
-            # Handle captures
-            should_capture = False
+            cv2.putText(display, status, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 199, 255), 2)
+
+            # Guidance
+            if len(crops) < len(guidance):
+                cv2.putText(display, guidance[len(crops)], (10, 65),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 200), 2)
+
+            cv2.imshow("Knightro Enrollment (dlib)", display)
+
             key = cv2.waitKey(1) & 0xFF
- 
+            should_capture = False
+
             if key == ord('q'):
-                print("Enrollment cancelled.")
-                cap.release()
-                cv2.destroyAllWindows()
-                return []
+                break
             elif key == ord(' '):
                 should_capture = True
             elif key == ord('a'):
                 auto_mode = not auto_mode
                 print(f"Auto-capture {'ON' if auto_mode else 'OFF'}")
- 
-            if auto_mode and (time.time() - last_capture_time) >= delay_between:
+
+            if auto_mode and (time.time() - last_capture) >= 0.5:
                 should_capture = True
- 
-            # Capture if conditions met: exactly one face detected
+
             if should_capture and len(boxes) == 1:
                 box = boxes[0]
-                # Crop the face from the frame with a small margin.
                 margin = 20
                 y1 = max(0, box.y - margin)
                 y2 = min(frame.shape[0], box.y2 + margin)
                 x1 = max(0, box.x - margin)
                 x2 = min(frame.shape[1], box.x2 + margin)
                 crop = frame[y1:y2, x1:x2].copy()
- 
-                face_crops.append(crop)
-                last_capture_time = time.time()
-                print(f"  Captured {len(face_crops)}/{num_captures}")
- 
-                # Brief green flash to show capture happened
-                cv2.rectangle(display, (0, 0),
-                              (display.shape[1], display.shape[0]),
-                              (0, 255, 0), 10)
-                cv2.imshow("Knightro Enrollment", display)
-                cv2.waitKey(200)
- 
+
+                if crop.size > 0:
+                    crops.append(crop)
+                    last_capture = time.time()
+                    print(f"  Captured {len(crops)}/{num_captures}")
+
+                    # Flash green
+                    cv2.rectangle(display, (0, 0),
+                                  (display.shape[1], display.shape[0]),
+                                  (0, 255, 0), 10)
+                    cv2.imshow("Knightro Enrollment (dlib)", display)
+                    cv2.waitKey(200)
+
     cap.release()
     cv2.destroyAllWindows()
-    return face_crops
- 
- 
-def capture_face_from_photo(
-        
-    detector: FaceDetector,
-    photo_path: str,
-) -> list[np.ndarray]:
-    """Load a photo file and extract the face crop.
- 
-    Args:
-        detector: A FaceDetector instance.
-        photo_path: Path to a photo file (jpg, png, etc.)
- 
-    Returns:
-        A list containing a single face crop, or empty if no face found.
-    """
+    return crops
+
+
+def _capture_from_photo(detector: FaceDetector, photo_path: str) -> list:
+    """Extract face from a photo."""
     image = cv2.imread(photo_path)
     if image is None:
-        print(f"ERROR: Could not read image at {photo_path}")
+        print(f"ERROR: Could not read {photo_path}")
         return []
- 
+
     with detector:
         boxes = detector.detect(image)
- 
-    if len(boxes) == 0:
-        print("ERROR: No face detected in the photo.")
+
+    if not boxes:
+        print("ERROR: No face detected in photo.")
         return []
-    if len(boxes) > 1:
-        print(f"WARNING: {len(boxes)} faces found, using the largest one.")
-        # Pick the largest face by area
-        boxes.sort(key=lambda b: b.width * b.height, reverse=True)
- 
-    box = boxes[0]
+
+    box = max(boxes, key=lambda b: b.width * b.height)
     margin = 20
     y1 = max(0, box.y - margin)
     y2 = min(image.shape[0], box.y2 + margin)
     x1 = max(0, box.x - margin)
     x2 = min(image.shape[1], box.x2 + margin)
-    crop = image[y1:y2, x1:x2].copy()
- 
-    print(f"Face detected with confidence {box.confidence:.2f}")
-    return [crop]
- 
- 
-# ---------------------------------------------------------------------------
-# Enrollment logic
-# ---------------------------------------------------------------------------
- 
-def enroll_faculty(name: str, photo_path: str | None = None) -> bool:
-    """Enroll a faculty member in the face recognition system.
- 
-    Args:
-        name: The faculty member's name (used for greetings).
-        photo_path: Optional path to a photo. If None, uses webcam.
- 
-    Returns:
-        True if enrollment succeeded, False otherwise.
-    """
-    print(f"\n=== Enrolling: {name} ===")
- 
-    detector = FaceDetector(min_confidence=0.5)
-    embedder = FaceEmbedder()
- 
-    # Step 1: Capture face images
-    if photo_path:
-        crops = capture_face_from_photo(detector, photo_path)
-    else:
-        crops = capture_faces_from_webcam(detector, num_captures=10)
- 
-    if not crops:
-        print("ERROR: No faces captured. Enrollment cancelled.")
-        return False
- 
-    print(f"\nComputing embeddings from {len(crops)} capture(s)...")
- 
-    # Step 2: Compute embedding for each capture
-    embeddings = []
-    for i, crop in enumerate(crops):
-        emb = embedder.embed(crop)
-        embeddings.append(emb)
-        print(f"  Embedding {i+1}/{len(crops)} computed (dim={len(emb)})")
- 
-    # Step 3: Store ALL embeddings (multi-template approach).
-    # Instead of averaging into one embedding, we keep all of them.
-    # During recognition, a new face must match a MAJORITY of these
-    # templates to be considered a match. This dramatically reduces
-    # false positives because an unknown person would need to
-    # coincidentally match most of the templates, not just the average.
-    print(f"\n{len(embeddings)} templates computed for {name}")
- 
-    # Step 4: Save to encrypted database.
-    try:
-        from face_database import FaceDatabase
-        db = FaceDatabase()
-        db.add_face(name, embeddings)
-        db.save()
-        print(f"SUCCESS: {name} enrolled with {len(embeddings)} templates "
-              f"in encrypted database.")
-    except ImportError:
-        save_path = PROJECT_ROOT / "data" / "enrollments"
-        save_path.mkdir(parents=True, exist_ok=True)
-        file_path = save_path / f"{name.replace(' ', '_')}.npy"
-        np.save(str(file_path), np.array(embeddings))
-        print(f"NOTE: face_database module not found (SD-10 not yet built).")
-        print(f"Saved raw embeddings to {file_path}")
- 
-    return True
- 
- 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
- 
+    return [image[y1:y2, x1:x2].copy()]
+
+
+def test_separation():
+    """Test Euclidean distance separation between all enrolled people."""
+    db = get_db()
+    enrolled = db.get_all()
+
+    if len(enrolled) < 2:
+        print("Need at least 2 enrolled people to test separation.")
+        return
+
+    names = sorted(enrolled.keys())
+    print(f"\n=== dlib Separation Test ({len(names)} people) ===")
+    print(f"Threshold: 0.5 (below = match, above = different person)\n")
+
+    print("Cross-person distances (higher = better):")
+    for i, a in enumerate(names):
+        for j, b in enumerate(names):
+            if i >= j:
+                continue
+            dists = [
+                np.linalg.norm(e1 - e2)
+                for e1 in enrolled[a]
+                for e2 in enrolled[b]
+            ]
+            avg = np.mean(dists)
+            mn = np.min(dists)
+            status = "GOOD" if avg > 0.6 else "OK" if avg > 0.4 else "CLOSE"
+            print(f"  {a} vs {b}: avg={avg:.4f}, min={mn:.4f} [{status}]")
+
+    print("\nSelf-similarity (lower = more consistent):")
+    for name, templates in sorted(enrolled.items()):
+        if len(templates) < 2:
+            print(f"  {name}: only 1 template")
+            continue
+        dists = [
+            np.linalg.norm(templates[i] - templates[j])
+            for i in range(len(templates))
+            for j in range(i + 1, len(templates))
+        ]
+        print(f"  {name}: avg={np.mean(dists):.4f}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Knightro Faculty Face Recognition — Enrollment Tool",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python src/enroll.py --enroll --name "Dr. Smith"
-  python src/enroll.py --enroll --name "Dr. Smith" --photo headshot.jpg
-  python src/enroll.py --remove --name "Dr. Smith"
-  python src/enroll.py --list
-        """,
+        description="Knightro Face Enrollment (dlib)",
     )
- 
+
     action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument("--enroll", action="store_true",
-                        help="Enroll a new faculty member")
-    action.add_argument("--remove", action="store_true",
-                        help="Remove an enrolled faculty member")
-    action.add_argument("--list", action="store_true",
-                        help="List all enrolled faculty")
- 
-    parser.add_argument("--name", type=str,
-                        help="Faculty member's name (required for --enroll and --remove)")
-    parser.add_argument("--photo", type=str, default=None,
-                        help="Path to a photo file (optional, for --enroll)")
- 
+    action.add_argument("--enroll", action="store_true")
+    action.add_argument("--remove", action="store_true")
+    action.add_argument("--list", action="store_true")
+    action.add_argument("--test", action="store_true")
+
+    parser.add_argument("--name", type=str)
+    parser.add_argument("--photo", type=str, default=None)
+
     args = parser.parse_args()
- 
+
     if args.enroll:
         if not args.name:
-            print("ERROR: --name is required for enrollment.")
+            print("ERROR: --name required")
             return 1
-        success = enroll_faculty(args.name, args.photo)
-        return 0 if success else 1
- 
+        return 0 if enroll_faculty(args.name, args.photo) else 1
+
     elif args.remove:
         if not args.name:
-            print("ERROR: --name is required for removal.")
+            print("ERROR: --name required")
             return 1
-        try:
-            from face_database import FaceDatabase
-            db = FaceDatabase()
-            db.remove_face(args.name)
+        db = get_db()
+        if db.remove_face(args.name):
             db.save()
-            print(f"SUCCESS: {args.name} removed from database.")
-        except ImportError:
-            # Fallback: try to delete the .npy file
-            file_path = PROJECT_ROOT / "data" / "enrollments" / f"{args.name.replace(' ', '_')}.npy"
-            if file_path.exists():
-                file_path.unlink()
-                print(f"Removed {file_path}")
-            else:
-                print(f"No enrollment found for {args.name}")
+            print(f"Removed {args.name}")
+        else:
+            print(f"'{args.name}' not found")
         return 0
- 
+
     elif args.list:
-        try:
-            from face_database import FaceDatabase
-            db = FaceDatabase()
-            names = db.list_enrolled()
-            if names:
-                print(f"\nEnrolled faculty ({len(names)}):")
-                for name in sorted(names):
-                    print(f"  - {name}")
-            else:
-                print("No faculty currently enrolled.")
-        except ImportError:
-            # Fallback: list .npy files
-            enroll_dir = PROJECT_ROOT / "data" / "enrollments"
-            if enroll_dir.exists():
-                files = list(enroll_dir.glob("*.npy"))
-                if files:
-                    print(f"\nEnrolled faculty ({len(files)}):")
-                    for f in sorted(files):
-                        print(f"  - {f.stem.replace('_', ' ')}")
-                else:
-                    print("No faculty currently enrolled.")
-            else:
-                print("No faculty currently enrolled.")
+        db = get_db()
+        names = db.list_enrolled()
+        if names:
+            print(f"\nEnrolled faculty ({len(names)}) — dlib database:")
+            for n in names:
+                templates = db.get_embedding(n)
+                count = len(templates) if templates else 0
+                print(f"  - {n} ({count} templates, 128-dim)")
+        else:
+            print("No faculty enrolled in dlib database.")
         return 0
- 
+
+    elif args.test:
+        test_separation()
+        return 0
+
     return 0
- 
- 
+
+
 if __name__ == "__main__":
     sys.exit(main())

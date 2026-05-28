@@ -7,9 +7,6 @@ This script ties together all subsystems into a single demo:
   4. Commands are routed through the interaction pipeline
   5. Knightro speaks the response (via Piper TTS)
 
-Requirements:
-    pip install piper-tts sounddevice soundfile opencv-python mediapipe onnxruntime
-
 Usage:
     cd "Interaction Pipeline"
     python3 integrated_demo.py
@@ -17,6 +14,8 @@ Usage:
     Press 'q' in the camera window to quit.
     Press 'w' to simulate wake word.
 
+Requirements:
+    pip install piper-tts sounddevice soundfile opencv-python mediapipe onnxruntime
 """
 
 import os
@@ -49,7 +48,7 @@ import tts
 # ---- SETTINGS ----
 CAMERA_INDEX = 0
 RECOGNITION_COOLDOWN = 10.0
-GREETING_DELAY_FRAMES = 150       # ~5 seconds at 30 FPS
+GREETING_DELAY_FRAMES = 3       # 3 seconds at 30 FPS
 STT_MODE = "whisper"                # "typed" or "whisper"
 WAKE_WORD_MODE = True
 
@@ -73,8 +72,8 @@ class KnightroDemo:
         from face_database import FaceDatabase
 
         cv_data_dir = Path(_CV_ROOT) / "data"
-        db_path = cv_data_dir / "face_embeddings.enc"
-        key_path = cv_data_dir / ".encryption_key"
+        db_path = cv_data_dir / "dlib_face_embeddings.enc"
+        key_path = cv_data_dir / ".dlib_encryption_key"
 
         print(f"[demo] Looking for face database at: {db_path}")
         print(f"[demo] Database exists: {db_path.exists()}")
@@ -83,7 +82,7 @@ class KnightroDemo:
 
         print("[demo] Initializing face recognizer...")
         self.recognizer = FaceRecognizer(
-            similarity_threshold=0.95,
+            similarity_threshold=0.970,
             db=db,
         )
 
@@ -114,6 +113,9 @@ class KnightroDemo:
         print("  w = wake word (activate Knightro)")
         print()
 
+        # Store camera reference so recognition retries can grab fresh frames
+        self._cap = cap
+
         # Start the input reader thread (reads typed input without blocking)
         if STT_MODE == "typed":
             threading.Thread(target=self._input_reader, daemon=True).start()
@@ -127,6 +129,9 @@ class KnightroDemo:
                 ret, frame = cap.read()
                 if not ret:
                     break
+
+                # Mirror the frame — matches how enrollment captures were taken
+                frame = cv2.flip(frame, 1)
 
                 boxes = self.detector.detect(frame)
                 active_tracks = self.tracker.update(boxes)
@@ -215,7 +220,7 @@ class KnightroDemo:
         # Speak BEFORE setting _activated so the camera loop doesn't
         # start recognition while Knightro is still talking
         tts.speak("Hey! I'm here! Let me see who I'm talking to!")
-        time.sleep(3.0)
+        time.sleep(1.0)
         # NOW enable recognition
         self._activated = True
         self._recognized_tracks.clear()
@@ -263,26 +268,60 @@ class KnightroDemo:
     # ------------------------------------------------------------------
 
     def _recognize_and_greet(self, frame, track):
-        """Run face recognition and handle the full interaction. Runs in a thread."""
-        box = track.bbox
-        margin = 20
-        y1 = max(0, box.y - margin)
-        y2 = min(frame.shape[0], box.y2 + margin)
-        x1 = max(0, box.x - margin)
-        x2 = min(frame.shape[1], box.x2 + margin)
-        face_crop = frame[y1:y2, x1:x2]
+        """Run face recognition with retries. Runs in a thread."""
+        MAX_RETRIES = 3
+        best_result = None
 
-        if face_crop.size == 0:
+        for attempt in range(MAX_RETRIES):
+            # Use the stored camera reference to grab a FRESH frame each retry
+            if attempt > 0 and hasattr(self, '_cap') and self._cap is not None:
+                ret, frame = self._cap.read()
+                if not ret:
+                    break
+                frame = cv2.flip(frame, 1)
+                # Re-detect faces in the fresh frame
+                boxes = self.detector.detect(frame)
+                if not boxes:
+                    print(f"[demo] Retry {attempt+1}: no face detected, skipping")
+                    time.sleep(0.3)
+                    continue
+                # Use the largest face
+                largest = max(boxes, key=lambda b: b.width * b.height)
+                box_to_use = largest
+            else:
+                box_to_use = track.bbox
+
+            margin = 20
+            y1 = max(0, box_to_use.y - margin)
+            y2 = min(frame.shape[0], box_to_use.y2 + margin)
+            x1 = max(0, box_to_use.x - margin)
+            x2 = min(frame.shape[1], box_to_use.x2 + margin)
+            face_crop = frame[y1:y2, x1:x2]
+
+            if face_crop.size == 0:
+                continue
+
+            result = self.recognizer.recognize(face_crop)
+            print(f"[demo] Recognition attempt {attempt+1}/{MAX_RETRIES}: "
+                  f"name={result.name}, similarity={result.distance:.3f}, "
+                  f"is_known={result.is_known}")
+
+            if result.is_known:
+                best_result = result
+                break
+            else:
+                # Keep the best unknown result in case all retries fail
+                if best_result is None or result.distance > best_result.distance:
+                    best_result = result
+                time.sleep(0.3)  # Brief pause before retry
+
+        if best_result is None:
             self._busy = False
             return
 
-        result = self.recognizer.recognize(face_crop)
-        print(f"[demo] Recognition: name={result.name}, "
-              f"similarity={result.distance:.3f}, is_known={result.is_known}")
-
-        if result.is_known:
-            self._status_msg = f"Recognized: {result.name}?"
-            self._confirm_and_greet(result.name)
+        if best_result.is_known:
+            self._status_msg = f"Recognized: {best_result.name}?"
+            self._confirm_and_greet(best_result.name)
         else:
             self._status_msg = "Unknown visitor"
             self._greet_unknown_and_listen()
@@ -296,7 +335,7 @@ class KnightroDemo:
 
         tts.speak(f"Hello! Are you {name}?")
         self._status_msg = f"Asking: Are you {name}?"
-        time.sleep(1.0)  # Let audio finish before opening mic
+        time.sleep(0.5)  # Let audio finish before opening mic
 
         text = self._get_user_input("You (yes/no): ", timeout=15.0)
         if text is None:
@@ -338,7 +377,7 @@ class KnightroDemo:
         """Greet an unknown visitor and listen for commands."""
         import random
         greetings = [
-            "Hey there! Welcome to U-C-F! I'm Knightro!",
+            "Hey there! Welcome to UCF! I'm Knightro!",
             "What's up! Welcome to the Engineering building! Go Knights!",
             "Hey! I don't think we've met. I'm Knightro, UCF's mascot!",
             "Welcome, fellow Knight! How can I help you today?",

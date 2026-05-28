@@ -115,7 +115,7 @@ This installs only the **core** packages (`opencv-python`, `mediapipe`, `numpy`)
 Opens your webcam, draws boxes around detected faces, and shows FPS and face count in the corner. This is the **laptop baseline benchmark** that Phase 2 will compare against Pi performance.
 
 ```bash
-python tests/test_face_detection.py
+python tests/test_face_recognition.py
 ```
 
 | Key | Action |
